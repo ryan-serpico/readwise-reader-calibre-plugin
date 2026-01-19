@@ -3,6 +3,8 @@
 
 from calibre.web.feeds.news import BasicNewsRecipe
 import json
+import os
+import tempfile
 
 try:
     from urllib.request import Request, urlopen
@@ -21,6 +23,7 @@ class ReadwiseReader(BasicNewsRecipe):
     remove_javascript = True
     ignore_duplicate_articles = {'url'}
     needs_subscription = True
+    auto_cleanup = False
 
     # Default settings
     max_articles_per_feed = 20
@@ -112,11 +115,33 @@ class ReadwiseReader(BasicNewsRecipe):
 
         return articles[:max_count]
 
+    def _build_html(self, content, title, author):
+        """Build a complete HTML document from article content."""
+        from html import escape
+        safe_title = escape(title) if title else 'Untitled'
+        author_line = f'<p class="author">By {escape(author)}</p>' if author else ''
+
+        return f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{safe_title}</title>
+</head>
+<body>
+    <article>
+        <h1>{safe_title}</h1>
+        {author_line}
+        <div class="content">
+            {content}
+        </div>
+    </article>
+</body>
+</html>'''
+
     def parse_index(self):
         """Parse the Readwise Reader API and return article index."""
         # Get max articles from recipe options
         max_articles = 20
-        opts = self.recipe_specific_options.get('max_articles', {})
         if hasattr(self, 'recipe_specific_options'):
             try:
                 opt_value = self.get_recipe_specific_option('max_articles')
@@ -139,26 +164,39 @@ class ReadwiseReader(BasicNewsRecipe):
 
         self.log(f'Found {len(articles)} articles')
 
+        # Sort by saved date (most recent first)
+        articles.sort(key=lambda x: x.get('saved_at', x.get('created_at', '')), reverse=True)
+
+        # Create temp directory for article HTML files
+        self._temp_dir = tempfile.mkdtemp(prefix='readwise_reader_')
+        self.log(f'Using temp directory: {self._temp_dir}')
+
         # Build the article index
         feed_articles = []
-        for article in articles:
+        for idx, article in enumerate(articles):
             title = article.get('title') or 'Untitled'
             url = article.get('source_url') or article.get('url', '')
             author = article.get('author', '')
             summary = article.get('summary', '')
-            html_content = article.get('html', '')
+            html_content = article.get('html_content', '')
 
             if not html_content:
                 self.log.warn(f'Skipping "{title}" - no HTML content available')
                 continue
 
-            # Store the HTML content for later retrieval
-            article_id = article.get('id', url)
-            self._store_article_content(article_id, html_content, title, author)
+            # Write HTML to temp file
+            html = self._build_html(html_content, title, author)
+            filename = f'article_{idx}.html'
+            filepath = os.path.join(self._temp_dir, filename)
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(html)
+
+            self.log(f'Saved article: {title}')
 
             feed_articles.append({
                 'title': title,
-                'url': f'readwise://{article_id}',
+                'url': 'file://' + filepath,
                 'author': author,
                 'description': summary,
             })
@@ -167,64 +205,8 @@ class ReadwiseReader(BasicNewsRecipe):
             self.log.warn('No articles with content found.')
             return []
 
+        self.log(f'Prepared {len(feed_articles)} articles for download')
         return [('Readwise Reader Inbox', feed_articles)]
-
-    def _store_article_content(self, article_id, html_content, title, author):
-        """Store article content for later retrieval."""
-        if not hasattr(self, '_article_cache'):
-            self._article_cache = {}
-
-        self._article_cache[str(article_id)] = {
-            'html': html_content,
-            'title': title,
-            'author': author
-        }
-
-    def get_article_url(self, article):
-        """Override to handle our custom URL scheme."""
-        return article.url
-
-    def get_browser(self, *args, **kwargs):
-        """Get browser instance."""
-        return BasicNewsRecipe.get_browser(self, *args, **kwargs)
-
-    def download_url(self, url, output_file):
-        """Download article content from our cache."""
-        if url.startswith('readwise://'):
-            article_id = url.replace('readwise://', '')
-            if hasattr(self, '_article_cache') and article_id in self._article_cache:
-                cached = self._article_cache[article_id]
-                html = self._build_html(
-                    cached['html'],
-                    cached['title'],
-                    cached['author']
-                )
-                with open(output_file, 'wb') as f:
-                    f.write(html.encode('utf-8'))
-                return output_file
-
-        return BasicNewsRecipe.download_url(self, url, output_file)
-
-    def _build_html(self, content, title, author):
-        """Build a complete HTML document from article content."""
-        author_line = f'<p class="author">By {author}</p>' if author else ''
-
-        return f'''<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>{title}</title>
-</head>
-<body>
-    <article>
-        <h1>{title}</h1>
-        {author_line}
-        <div class="content">
-            {content}
-        </div>
-    </article>
-</body>
-</html>'''
 
     def preprocess_html(self, soup):
         """Clean up the HTML before conversion."""
@@ -237,11 +219,3 @@ class ReadwiseReader(BasicNewsRecipe):
             style.decompose()
 
         return soup
-
-    def postprocess_html(self, soup, first_fetch):
-        """Post-process HTML after fetching."""
-        return soup
-
-    def print_version(self, url):
-        """Return the URL for printing/reading."""
-        return url
