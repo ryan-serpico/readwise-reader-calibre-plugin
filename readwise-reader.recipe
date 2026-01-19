@@ -1,0 +1,247 @@
+#!/usr/bin/env python
+# vim:fileencoding=utf-8
+
+from calibre.web.feeds.news import BasicNewsRecipe
+import json
+
+try:
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError, URLError
+except ImportError:
+    from urllib2 import Request, urlopen, HTTPError, URLError
+
+
+class ReadwiseReader(BasicNewsRecipe):
+    title = 'Readwise Reader'
+    __author__ = 'Ryan'
+    description = 'Fetch articles from your Readwise Reader inbox'
+    language = 'en'
+    encoding = 'utf-8'
+    no_stylesheets = True
+    remove_javascript = True
+    ignore_duplicate_articles = {'url'}
+    needs_subscription = True
+
+    # Default settings
+    max_articles_per_feed = 20
+    oldest_article = 365
+
+    # Recipe-specific options for user configuration
+    recipe_specific_options = {
+        'max_articles': {
+            'short': 'Maximum articles',
+            'long': 'Maximum number of articles to download (default: 20)',
+            'default': '20'
+        }
+    }
+
+    # Readwise API configuration
+    API_BASE = 'https://readwise.io/api/v3'
+
+    def get_cover_url(self):
+        return None
+
+    def _get_token(self):
+        """Get the API token from Calibre's password field."""
+        if not self.password:
+            raise ValueError(
+                'Readwise API token is required. '
+                'Enter your token in the password field. '
+                'Get your token at: https://readwise.io/access_token'
+            )
+        return self.password.strip()
+
+    def _api_request(self, endpoint, params=None):
+        """Make an authenticated request to the Readwise API."""
+        token = self._get_token()
+        url = f'{self.API_BASE}/{endpoint}'
+
+        if params:
+            query_string = '&'.join(f'{k}={v}' for k, v in params.items())
+            url = f'{url}?{query_string}'
+
+        request = Request(url)
+        request.add_header('Authorization', f'Token {token}')
+        request.add_header('Accept', 'application/json')
+
+        try:
+            response = urlopen(request, timeout=30)
+            return json.loads(response.read().decode('utf-8'))
+        except HTTPError as e:
+            if e.code == 401:
+                raise ValueError(
+                    'Invalid API token. Please check your Readwise API token. '
+                    'Get a valid token at: https://readwise.io/access_token'
+                )
+            elif e.code == 429:
+                raise ValueError(
+                    'Rate limited by Readwise API. Please try again later.'
+                )
+            else:
+                raise ValueError(f'API request failed: HTTP {e.code}')
+        except URLError as e:
+            raise ValueError(f'Network error: {e.reason}')
+
+    def _fetch_articles(self, max_count):
+        """Fetch articles from Readwise Reader inbox."""
+        articles = []
+        cursor = None
+
+        while len(articles) < max_count:
+            params = {
+                'location': 'new',
+                'category': 'article',
+                'withHtmlContent': 'true',
+                'pageSize': min(100, max_count - len(articles))
+            }
+
+            if cursor:
+                params['pageCursor'] = cursor
+
+            data = self._api_request('list/', params)
+            results = data.get('results', [])
+
+            if not results:
+                break
+
+            articles.extend(results)
+            cursor = data.get('nextPageCursor')
+
+            if not cursor:
+                break
+
+        return articles[:max_count]
+
+    def parse_index(self):
+        """Parse the Readwise Reader API and return article index."""
+        # Get max articles from recipe options
+        max_articles = 20
+        opts = self.recipe_specific_options.get('max_articles', {})
+        if hasattr(self, 'recipe_specific_options'):
+            try:
+                opt_value = self.get_recipe_specific_option('max_articles')
+                if opt_value:
+                    max_articles = int(opt_value)
+            except (ValueError, AttributeError):
+                pass
+
+        self.log(f'Fetching up to {max_articles} articles from Readwise Reader inbox...')
+
+        try:
+            articles = self._fetch_articles(max_articles)
+        except ValueError as e:
+            self.log.error(str(e))
+            raise
+
+        if not articles:
+            self.log.warn('No articles found in your Readwise Reader inbox.')
+            return []
+
+        self.log(f'Found {len(articles)} articles')
+
+        # Build the article index
+        feed_articles = []
+        for article in articles:
+            title = article.get('title') or 'Untitled'
+            url = article.get('source_url') or article.get('url', '')
+            author = article.get('author', '')
+            summary = article.get('summary', '')
+            html_content = article.get('html', '')
+
+            if not html_content:
+                self.log.warn(f'Skipping "{title}" - no HTML content available')
+                continue
+
+            # Store the HTML content for later retrieval
+            article_id = article.get('id', url)
+            self._store_article_content(article_id, html_content, title, author)
+
+            feed_articles.append({
+                'title': title,
+                'url': f'readwise://{article_id}',
+                'author': author,
+                'description': summary,
+            })
+
+        if not feed_articles:
+            self.log.warn('No articles with content found.')
+            return []
+
+        return [('Readwise Reader Inbox', feed_articles)]
+
+    def _store_article_content(self, article_id, html_content, title, author):
+        """Store article content for later retrieval."""
+        if not hasattr(self, '_article_cache'):
+            self._article_cache = {}
+
+        self._article_cache[str(article_id)] = {
+            'html': html_content,
+            'title': title,
+            'author': author
+        }
+
+    def get_article_url(self, article):
+        """Override to handle our custom URL scheme."""
+        return article.url
+
+    def get_browser(self, *args, **kwargs):
+        """Get browser instance."""
+        return BasicNewsRecipe.get_browser(self, *args, **kwargs)
+
+    def download_url(self, url, output_file):
+        """Download article content from our cache."""
+        if url.startswith('readwise://'):
+            article_id = url.replace('readwise://', '')
+            if hasattr(self, '_article_cache') and article_id in self._article_cache:
+                cached = self._article_cache[article_id]
+                html = self._build_html(
+                    cached['html'],
+                    cached['title'],
+                    cached['author']
+                )
+                with open(output_file, 'wb') as f:
+                    f.write(html.encode('utf-8'))
+                return output_file
+
+        return BasicNewsRecipe.download_url(self, url, output_file)
+
+    def _build_html(self, content, title, author):
+        """Build a complete HTML document from article content."""
+        author_line = f'<p class="author">By {author}</p>' if author else ''
+
+        return f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{title}</title>
+</head>
+<body>
+    <article>
+        <h1>{title}</h1>
+        {author_line}
+        <div class="content">
+            {content}
+        </div>
+    </article>
+</body>
+</html>'''
+
+    def preprocess_html(self, soup):
+        """Clean up the HTML before conversion."""
+        # Remove any script tags that might have slipped through
+        for script in soup.find_all('script'):
+            script.decompose()
+
+        # Remove style tags
+        for style in soup.find_all('style'):
+            style.decompose()
+
+        return soup
+
+    def postprocess_html(self, soup, first_fetch):
+        """Post-process HTML after fetching."""
+        return soup
+
+    def print_version(self, url):
+        """Return the URL for printing/reading."""
+        return url
