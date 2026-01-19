@@ -42,6 +42,8 @@ class ReadwiseReader(BasicNewsRecipe):
     API_BASE = 'https://readwise.io/api/v3'
 
     def get_cover_url(self):
+        if hasattr(self, '_cover_path') and self._cover_path:
+            return 'file://' + self._cover_path
         return None
 
     def _get_token(self):
@@ -114,6 +116,123 @@ class ReadwiseReader(BasicNewsRecipe):
                 break
 
         return articles[:max_count]
+
+    def _generate_cover(self, image_urls, article_count):
+        """Generate a cover image with article thumbnails and text overlay."""
+        from io import BytesIO
+        from datetime import datetime
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            self.log.warn('PIL not available, skipping cover generation')
+            return None
+
+        COVER_WIDTH, COVER_HEIGHT = 600, 800
+        GRID_COLS, GRID_ROWS = 2, 2
+        CELL_WIDTH = COVER_WIDTH // GRID_COLS
+        CELL_HEIGHT = COVER_HEIGHT // GRID_ROWS
+
+        # Create base image with dark background
+        cover = Image.new('RGB', (COVER_WIDTH, COVER_HEIGHT), (26, 26, 26))
+
+        # Download and place images in grid
+        images_placed = 0
+        for idx, url in enumerate(image_urls[:4]):
+            if not url:
+                continue
+            try:
+                self.log(f'Downloading cover image {idx + 1}: {url[:50]}...')
+                request = Request(url)
+                request.add_header('User-Agent', 'Mozilla/5.0')
+                response = urlopen(request, timeout=10)
+                img_data = response.read()
+                img = Image.open(BytesIO(img_data))
+
+                # Convert to RGB if necessary
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+
+                # Resize to fill cell while maintaining aspect ratio, then crop
+                img_ratio = img.width / img.height
+                cell_ratio = CELL_WIDTH / CELL_HEIGHT
+
+                if img_ratio > cell_ratio:
+                    # Image is wider - fit height, crop width
+                    new_height = CELL_HEIGHT
+                    new_width = int(new_height * img_ratio)
+                else:
+                    # Image is taller - fit width, crop height
+                    new_width = CELL_WIDTH
+                    new_height = int(new_width / img_ratio)
+
+                img = img.resize((new_width, new_height), Image.LANCZOS)
+
+                # Crop to cell size from center
+                left = (new_width - CELL_WIDTH) // 2
+                top = (new_height - CELL_HEIGHT) // 2
+                img = img.crop((left, top, left + CELL_WIDTH, top + CELL_HEIGHT))
+
+                # Calculate position in grid
+                row = idx // GRID_COLS
+                col = idx % GRID_COLS
+                x = col * CELL_WIDTH
+                y = row * CELL_HEIGHT
+
+                cover.paste(img, (x, y))
+                images_placed += 1
+
+            except Exception as e:
+                self.log.warn(f'Failed to download image {url}: {e}')
+                continue
+
+        self.log(f'Placed {images_placed} images in cover grid')
+
+        # Create overlay
+        overlay = Image.new('RGBA', (COVER_WIDTH, COVER_HEIGHT), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        # Semi-transparent overlay at bottom
+        overlay_height = 140
+        draw.rectangle(
+            [(0, COVER_HEIGHT - overlay_height), (COVER_WIDTH, COVER_HEIGHT)],
+            fill=(0, 0, 0, 200)
+        )
+
+        # Try to use a nice font, fall back to default
+        try:
+            title_font = ImageFont.truetype('/System/Library/Fonts/Helvetica.ttc', 32)
+            date_font = ImageFont.truetype('/System/Library/Fonts/Helvetica.ttc', 24)
+            count_font = ImageFont.truetype('/System/Library/Fonts/Helvetica.ttc', 20)
+        except (IOError, OSError):
+            try:
+                title_font = ImageFont.truetype('arial.ttf', 32)
+                date_font = ImageFont.truetype('arial.ttf', 24)
+                count_font = ImageFont.truetype('arial.ttf', 20)
+            except (IOError, OSError):
+                title_font = ImageFont.load_default()
+                date_font = title_font
+                count_font = title_font
+
+        # Draw text
+        text_x = 20
+        base_y = COVER_HEIGHT - overlay_height + 15
+
+        draw.text((text_x, base_y), 'Readwise Reader', font=title_font, fill='white')
+        draw.text((text_x, base_y + 40), datetime.now().strftime('%B %d, %Y'), font=date_font, fill=(200, 200, 200))
+        draw.text((text_x, base_y + 75), f'{article_count} Articles', font=count_font, fill=(170, 170, 170))
+
+        # Composite overlay onto cover
+        cover = cover.convert('RGBA')
+        cover = Image.alpha_composite(cover, overlay)
+        cover = cover.convert('RGB')
+
+        # Save to temp file
+        cover_path = os.path.join(self._temp_dir, 'cover.jpg')
+        cover.save(cover_path, 'JPEG', quality=90)
+        self.log(f'Generated cover image: {cover_path}')
+
+        return cover_path
 
     def _build_html(self, content, title, author, site_name=None, reading_time=None, published_date=None, summary=None):
         """Build a complete HTML document from article content."""
@@ -206,6 +325,16 @@ class ReadwiseReader(BasicNewsRecipe):
         # Create temp directory for article HTML files
         self._temp_dir = tempfile.mkdtemp(prefix='readwise_reader_')
         self.log(f'Using temp directory: {self._temp_dir}')
+
+        # Collect image URLs for cover generation
+        image_urls = [a.get('image_url') for a in articles if a.get('image_url')]
+        self.log(f'Found {len(image_urls)} articles with images for cover')
+
+        # Generate cover image
+        if image_urls:
+            cover_path = self._generate_cover(image_urls, len(articles))
+            if cover_path:
+                self._cover_path = cover_path
 
         # Build the article index
         feed_articles = []
