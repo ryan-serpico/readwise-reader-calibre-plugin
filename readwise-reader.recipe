@@ -115,11 +115,44 @@ class ReadwiseReader(BasicNewsRecipe):
 
         return articles[:max_count]
 
-    def _build_html(self, content, title, author):
+    def _build_html(self, content, title, author, site_name=None, reading_time=None, published_date=None, summary=None):
         """Build a complete HTML document from article content."""
         from html import escape
         safe_title = escape(title) if title else 'Untitled'
-        author_line = f'<p class="author">By {escape(author)}</p>' if author else ''
+
+        # Build metadata lines
+        meta_parts = []
+        if site_name:
+            meta_parts.append(escape(site_name))
+        if author:
+            meta_parts.append(f'By {escape(author)}')
+
+        meta_line = ''
+        if meta_parts:
+            meta_line = f'<p class="meta">{" · ".join(meta_parts)}</p>'
+
+        # Build secondary metadata (reading time, published date)
+        details_parts = []
+        if reading_time:
+            details_parts.append(f'{reading_time} min read')
+        if published_date:
+            # Format date nicely if it's an ISO string
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(published_date.replace('Z', '+00:00'))
+                formatted_date = dt.strftime('%B %d, %Y')
+                details_parts.append(formatted_date)
+            except (ValueError, AttributeError):
+                details_parts.append(escape(str(published_date)))
+
+        details_line = ''
+        if details_parts:
+            details_line = f'<p class="details">{" · ".join(details_parts)}</p>'
+
+        # Summary/description
+        summary_line = ''
+        if summary:
+            summary_line = f'<p class="summary"><em>{escape(summary)}</em></p>'
 
         return f'''<!DOCTYPE html>
 <html>
@@ -130,7 +163,10 @@ class ReadwiseReader(BasicNewsRecipe):
 <body>
     <article>
         <h1>{safe_title}</h1>
-        {author_line}
+        {meta_line}
+        {details_line}
+        {summary_line}
+        <hr>
         <div class="content">
             {content}
         </div>
@@ -179,13 +215,25 @@ class ReadwiseReader(BasicNewsRecipe):
             author = article.get('author', '')
             summary = article.get('summary', '')
             html_content = article.get('html_content', '')
+            site_name = article.get('site_name', '')
+            reading_time = article.get('reading_progress', {}).get('time_remaining') if isinstance(article.get('reading_progress'), dict) else None
+            # Try reading_time field directly if available
+            if not reading_time:
+                reading_time = article.get('reading_time')
+            published_date = article.get('published_date', '')
 
             if not html_content:
                 self.log.warn(f'Skipping "{title}" - no HTML content available')
                 continue
 
             # Write HTML to temp file
-            html = self._build_html(html_content, title, author)
+            html = self._build_html(
+                html_content, title, author,
+                site_name=site_name,
+                reading_time=reading_time,
+                published_date=published_date,
+                summary=summary
+            )
             filename = f'article_{idx}.html'
             filepath = os.path.join(self._temp_dir, filename)
 
